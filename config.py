@@ -17,4 +17,14 @@ CONFIG = {
     'redis_host': 'localhost',
     'redis_port': 6379,
     'redis_db': 0,
+    # MiniMax API配置 - 用于蒸馏学习
+    'minimax_api_key': '',  # MiniMax API密钥
+    'minimax_api_url': 'https://api.minimax.chat/v1/text/chatcompletion_v2',  # MiniMax API地址
+    'minimax_model': 'MiniMax-Text-01',  # MiniMax模型名称
+    'use_distill': False,  # 是否启用蒸馏学习
+    'distill_alpha': 0.7,  # 策略蒸馏权重
+    'distill_beta': 0.3,   # 价值蒸馏权重
+    'distill_batch_size': 16,  # 蒸馏批次大小
+    'distill_cache_size': 50000,  # 蒸馏缓存大小
+    'distill_temperature': 1.0,  # 蒸馏温度参数
 }

@@ -97,6 +97,9 @@ class PolicyValueNet:
         self.optimizer = torch.optim.Adam(params=self.policy_value_net.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=self.l2_const)
         if model_file:
             self.policy_value_net.load_state_dict(torch.load(model_file))  # 加载模型参数
+        # 蒸馏损失权重（可在训练时动态调整）
+        self.distill_alpha = 0.7  # 策略蒸馏权重
+        self.distill_beta = 0.3   # 价值蒸馏权重
 
     # 输入一个批次的状态，输出一个批次的动作概率和状态价值
     def policy_value(self, state_batch):
@@ -159,6 +162,163 @@ class PolicyValueNet:
                 torch.sum(torch.exp(log_act_probs) * log_act_probs, dim=1)
             )
         return loss.detach().cpu().numpy(), entropy.detach().cpu().numpy()
+
+    def distill_train_step(self, state_batch, teacher_policy, teacher_value, lr=0.002):
+        """
+        蒸馏训练步骤
+
+        Args:
+            state_batch: 学生网络输入状态 [batch, 9, 10, 9]
+            teacher_policy: 教师策略概率 [batch, 2086] (已归一化)
+            teacher_value: 教师价值评估 [batch, 1] 或 [batch]
+            lr: 学习率
+
+        Returns:
+            tuple: (总损失, 策略损失, 价值损失, 蒸馏损失, 熵)
+        """
+        self.policy_value_net.train()
+
+        # 包装变量
+        state_batch = torch.tensor(state_batch).to(self.device)
+        teacher_policy = torch.tensor(teacher_policy).to(self.device)
+        teacher_value = torch.tensor(teacher_value).to(self.device)
+
+        # 清零梯度
+        self.optimizer.zero_grad()
+        for params in self.optimizer.param_groups:
+            params['lr'] = lr
+
+        # 前向传播
+        log_act_probs, value = self.policy_value_net(state_batch)
+        value = torch.reshape(value, shape=[-1])
+
+        # 1. 传统监督损失
+        # 价值损失 (MSE)
+        value_loss = F.mse_loss(input=value, target=teacher_value)
+
+        # 策略损失 (交叉熵)
+        policy_loss = -torch.mean(torch.sum(teacher_policy * log_act_probs, dim=1))
+
+        # 2. 蒸馏损失
+        # 策略蒸馏损失 (KL散度) - 教师分布指导学生分布
+        # log_softmax(student) vs softmax(teacher) => 使用kl_div
+        student_log_probs = log_act_probs  # log_softmax已应用
+        teacher_probs = torch.exp(teacher_policy)  # 转为概率
+
+        # KL(teacher || student) = sum(teacher * (log_teacher - log_student))
+        distill_policy_loss = F.kl_div(
+            student_log_probs,
+            teacher_probs,
+            reduction='batchmean'
+        )
+
+        # 价值蒸馏损失 (MSE) - 教师价值指导学生价值
+        distill_value_loss = F.mse_loss(input=value, target=teacher_value)
+
+        # 3. 总损失 = 监督损失 + 蒸馏损失
+        # 传统损失权重
+        supervised_weight = 0.5
+        distill_weight = 0.5
+
+        total_loss = (
+            supervised_weight * (value_loss + policy_loss) +
+            distill_weight * (self.distill_alpha * distill_policy_loss + self.distill_beta * distill_value_loss)
+        )
+
+        # 反向传播
+        total_loss.backward()
+        self.optimizer.step()
+
+        # 计算熵
+        with torch.no_grad():
+            entropy = -torch.mean(
+                torch.sum(torch.exp(log_act_probs) * log_act_probs, dim=1)
+            )
+
+        return (
+            total_loss.detach().cpu().numpy(),
+            policy_loss.detach().cpu().numpy(),
+            value_loss.detach().cpu().numpy(),
+            (distill_policy_loss + distill_value_loss).detach().cpu().numpy(),
+            entropy.detach().cpu().numpy()
+        )
+
+    def mixed_train_step(self, state_batch, mcts_probs, winner_batch,
+                         teacher_policy=None, teacher_value=None,
+                         distill_ratio=0.5, lr=0.002):
+        """
+        混合训练：同时使用MCTS数据和教师API数据
+
+        Args:
+            state_batch: 状态批次
+            mcts_probs: MCTS策略概率
+            winner_batch: MCTS价值（胜负标签）
+            teacher_policy: 教师策略概率（可选）
+            teacher_value: 教师价值评估（可选）
+            distill_ratio: 蒸馏损失占总损失的比例
+            lr: 学习率
+
+        Returns:
+            dict: 各项损失值
+        """
+        self.policy_value_net.train()
+
+        # 包装变量
+        state_batch = torch.tensor(state_batch).to(self.device)
+        mcts_probs = torch.tensor(mcts_probs).to(self.device)
+        winner_batch = torch.tensor(winner_batch).to(self.device)
+
+        # 清零梯度
+        self.optimizer.zero_grad()
+        for params in self.optimizer.param_groups:
+            params['lr'] = lr
+
+        # 前向传播
+        log_act_probs, value = self.policy_value_net(state_batch)
+        value = torch.reshape(value, shape=[-1])
+
+        # 1. 传统MCTS监督损失
+        mcts_value_loss = F.mse_loss(input=value, target=winner_batch)
+        mcts_policy_loss = -torch.mean(torch.sum(mcts_probs * log_act_probs, dim=1))
+        supervised_loss = mcts_value_loss + mcts_policy_loss
+
+        # 2. 蒸馏损失（如果有教师数据）
+        distill_loss_val = torch.tensor(0.0)
+        if teacher_policy is not None and teacher_value is not None:
+            teacher_policy = torch.tensor(teacher_policy).to(self.device)
+            teacher_value = torch.tensor(teacher_value).to(self.device)
+
+            student_log_probs = log_act_probs
+            teacher_probs = torch.exp(teacher_policy)
+
+            d_policy_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+            d_value_loss = F.mse_loss(input=value, target=teacher_value)
+
+            distill_loss_val = self.distill_alpha * d_policy_loss + self.distill_beta * d_value_loss
+
+        # 3. 总损失
+        if distill_loss_val.item() > 0:
+            total_loss = (1 - distill_ratio) * supervised_loss + distill_ratio * distill_loss_val
+        else:
+            total_loss = supervised_loss
+
+        # 反向传播
+        total_loss.backward()
+        self.optimizer.step()
+
+        # 计算熵
+        with torch.no_grad():
+            entropy = -torch.mean(
+                torch.sum(torch.exp(log_act_probs) * log_act_probs, dim=1)
+            )
+
+        return {
+            'total_loss': total_loss.detach().cpu().numpy(),
+            'mcts_policy_loss': mcts_policy_loss.detach().cpu().numpy(),
+            'mcts_value_loss': mcts_value_loss.detach().cpu().numpy(),
+            'distill_loss': distill_loss_val.detach().cpu().numpy() if distill_loss_val.item() > 0 else 0.0,
+            'entropy': entropy.detach().cpu().numpy()
+        }
 
 
 if __name__ == '__main__':
