@@ -89,10 +89,18 @@ class Net(nn.Module):
 # 策略值网络，用来进行模型的训练
 class PolicyValueNet:
 
-    def __init__(self, model_file=None, use_gpu=True, device = 'cuda'):
+    def __init__(self, model_file=None, use_gpu=True, device = None):
         self.use_gpu = use_gpu
         self.l2_const = 2e-3    # l2 正则化
-        self.device = device
+        # 自动检测CUDA是否可用
+        if device is None:
+            if use_gpu and torch.cuda.is_available():
+                self.device = 'cuda'
+            else:
+                self.device = 'cpu'
+                print("警告: CUDA不可用，使用CPU运行")
+        else:
+            self.device = device
         self.policy_value_net = Net().to(self.device)
         self.optimizer = torch.optim.Adam(params=self.policy_value_net.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=self.l2_const)
         if model_file:
@@ -115,17 +123,20 @@ class PolicyValueNet:
         self.policy_value_net.eval()
         # 获取合法动作列表
         legal_positions = board.availables
-        current_state = np.ascontiguousarray(board.current_state().reshape(-1, 9, 10, 9)).astype('float16')
+        current_state = np.ascontiguousarray(board.current_state().reshape(-1, 9, 10, 9)).astype('float32')
         current_state = torch.as_tensor(current_state).to(self.device)
         # 使用神经网络进行预测
-        with autocast(): #半精度fp16
+        if self.device == 'cuda':
+            with autocast():  # 半精度fp16仅在GPU上使用
+                log_act_probs, value = self.policy_value_net(current_state)
+        else:
             log_act_probs, value = self.policy_value_net(current_state)
-        log_act_probs, value = log_act_probs.cpu() , value.cpu()
-        act_probs = np.exp(log_act_probs.numpy().flatten()) if CONFIG['use_frame'] == 'paddle' else np.exp(log_act_probs.detach().numpy().astype('float16').flatten())
+        log_act_probs, value = log_act_probs.detach().cpu(), value.detach().cpu()
+        act_probs = np.exp(log_act_probs.numpy().flatten())
         # 只取出合法动作
         act_probs = zip(legal_positions, act_probs[legal_positions])
         # 返回动作概率，以及状态价值
-        return act_probs, value.detach().numpy()
+        return act_probs, value.numpy()
 
     # 保存模型
     def save_model(self, model_file):

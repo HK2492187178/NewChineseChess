@@ -16,7 +16,8 @@ class MiniMaxAPI:
 
     def __init__(self):
         self.api_key = CONFIG['minimax_api_key']
-        self.api_url = CONFIG['minimax_api_url']
+        self.api_base = CONFIG['minimax_api_base']  # API base: https://api.minimaxi.com
+        self.api_url = self.api_base + '/v1/chat/completions'  # 完整端点地址
         self.model = CONFIG['minimax_model']
         self.temperature = CONFIG['distill_temperature']
         self.cache_size = CONFIG['distill_cache_size']
